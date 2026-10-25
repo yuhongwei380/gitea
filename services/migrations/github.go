@@ -6,6 +6,7 @@ package migrations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,7 +28,8 @@ var (
 	_ base.Downloader        = &GithubDownloaderV3{}
 	_ base.DownloaderFactory = &GithubDownloaderV3Factory{}
 	// GithubLimitRateRemaining limit to wait for new rate to apply
-	GithubLimitRateRemaining = 0
+	GithubLimitRateRemaining  = 0
+	errGithubIssueUnavailable = errors.New("GitHub issue is unavailable")
 )
 
 func init() {
@@ -141,6 +143,7 @@ func (g *GithubDownloaderV3) LogString() string {
 }
 
 func (g *GithubDownloaderV3) addClient(client *http.Client, baseURL string) error {
+	client.Transport = &githubRateLimitTransport{base: client.Transport}
 	opts := []github.ClientOptionsFunc{github.WithHTTPClient(client)}
 	if baseURL != "https://github.com" {
 		opts = append(opts, github.WithEnterpriseURLs(baseURL, baseURL))
@@ -169,8 +172,10 @@ func (g *GithubDownloaderV3) waitAndPickClient(ctx context.Context) {
 	}
 	g.curClientIdx = recentIdx
 
-	for g.rates[g.curClientIdx] != nil && g.rates[g.curClientIdx].Remaining <= GithubLimitRateRemaining {
-		timer := time.NewTimer(time.Until(g.rates[g.curClientIdx].Reset.Time))
+	for attempt := 0; attempt < githubRateLimitAttempts && g.rates[g.curClientIdx] != nil && g.rates[g.curClientIdx].Remaining <= GithubLimitRateRemaining; attempt++ {
+		delay := max(time.Second, time.Until(g.rates[g.curClientIdx].Reset.Time)+time.Second)
+		log.Info("migration-rate-wait repo=%s/%s delay=%s reset=%s", g.repoOwner, g.repoName, delay, g.rates[g.curClientIdx].Reset.Time.UTC().Format(time.RFC3339))
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -181,6 +186,7 @@ func (g *GithubDownloaderV3) waitAndPickClient(ctx context.Context) {
 		err := g.RefreshRate(ctx)
 		if err != nil {
 			log.Error("g.getClient().RateLimit.Get: %s", err)
+			return
 		}
 	}
 }
@@ -456,6 +462,7 @@ func (g *GithubDownloaderV3) GetIssues(ctx context.Context, page, perPage int) (
 		return nil, false, fmt.Errorf("GetIssues: %w", err)
 	}
 	log.Trace("Request get issues %d/%d, but in fact get %d", perPage, page, len(issues))
+	log.Info("migration-issue-page repo=%s/%s page=%d perPage=%d requestPage=%d requestAfter=%q status=%d requestID=%q count=%d link=%q nextPage=%d nextAfter=%q end=%t", g.repoOwner, g.repoName, page, perPage, opt.ListOptions.Page, opt.After, resp.StatusCode, resp.Header.Get("X-GitHub-Request-Id"), len(issues), resp.Header.Values("Link"), resp.NextPage, resp.After, resp.NextPage == 0 && resp.After == "")
 	g.setRate(&resp.Rate)
 	allIssues, err := g.convertGithubIssues(ctx, issues, perPage)
 	if err != nil {
@@ -463,6 +470,11 @@ func (g *GithubDownloaderV3) GetIssues(ctx context.Context, page, perPage int) (
 	}
 
 	g.issuePage, g.issueCursor, g.nextIssueCursor = page, opt.After, resp.After
+	indexes := make([]int64, len(allIssues))
+	for i, issue := range allIssues {
+		indexes[i] = issue.Number
+	}
+	log.Info("migration-issue-converted repo=%s/%s page=%d indexes=%v", g.repoOwner, g.repoName, page, indexes)
 	return allIssues, resp.NextPage == 0 && resp.After == "", nil
 }
 
@@ -471,6 +483,9 @@ func (g *GithubDownloaderV3) GetIssue(ctx context.Context, number int64) (*base.
 	g.waitAndPickClient(ctx)
 	issue, resp, err := g.getClient().Issues.Get(ctx, g.repoOwner, g.repoName, int(number))
 	if err != nil {
+		if resp != nil && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone) {
+			return nil, fmt.Errorf("%w: %w", errGithubIssueUnavailable, err)
+		}
 		return nil, err
 	}
 	g.setRate(&resp.Rate)

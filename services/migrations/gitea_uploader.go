@@ -568,7 +568,9 @@ func (g *GiteaLocalUploader) CreatePullRequests(ctx context.Context, prs ...*bas
 	}
 	for _, pr := range gprs {
 		g.issues[pr.Issue.Index] = pr.Issue
-		pull.StartPullRequestCheckImmediately(ctx, pr)
+		if !pr.Issue.IsClosed && !pr.HasMerged {
+			pull.StartPullRequestCheckImmediately(ctx, pr)
+		}
 	}
 	return nil
 }
@@ -612,6 +614,19 @@ func (g *GiteaLocalUploader) updateGitForPullRequest(ctx context.Context, pr *ba
 		return "", err
 	}
 
+	if g.gitServiceType == structs.GithubService && g.gitRepo != nil && pr.Head.SHA != "" {
+		sha, refErr := g.gitRepo.GetRefCommitID(ctx, pr.GetGitHeadRefName())
+		if refErr == nil && sha == pr.Head.SHA {
+			if pr.State == "closed" {
+				return pr.Head.Ref, nil
+			}
+			head = fmt.Sprintf("migration/github/pr-%d", pr.Number)
+			for g.gitRepo.IsBranchExist(ctx, head) {
+				head = fmt.Sprintf("migration/github/pr-%d-%s", pr.Number, uuid.New().String())
+			}
+			return head, git.UpdateRef(ctx, g.repo, git.BranchPrefix+head, sha)
+		}
+	}
 	head = "unknown repository"
 	if pr.IsForkPullRequest() && pr.State != "closed" {
 		// OK we want to fetch the current head as a branch from its CloneURL
@@ -632,8 +647,16 @@ func (g *GiteaLocalUploader) updateGitForPullRequest(ctx context.Context, pr *ba
 				// ... let's try something less nice
 				remote = "head-pr-" + strconv.FormatInt(pr.Number, 10)
 			}
-			// ... now add the remote
-			err := g.gitRepo.AddRemote(ctx, remote, pr.Head.CloneURL, true)
+			address, err := git.GetRemoteAddress(ctx, g.repo, remote)
+			if err != nil && !git.IsRemoteNotExistError(err) {
+				return "", err
+			}
+			if address != "" && address != pr.Head.CloneURL {
+				remote = "head-pr-" + strconv.FormatInt(pr.Number, 10) + "-" + uuid.New().String()
+			}
+			if address != pr.Head.CloneURL {
+				err = g.gitRepo.AddRemote(ctx, remote, pr.Head.CloneURL, false)
+			}
 			if err != nil {
 				log.Error("PR #%d in %s/%s AddRemote[%s] failed: %v", pr.Number, g.repoOwner, g.repoName, remote, err)
 			} else {
@@ -677,8 +700,8 @@ func (g *GiteaLocalUploader) updateGitForPullRequest(ctx context.Context, pr *ba
 				return head, nil
 			}
 			g.prHeadCache[pr.Head.CloneURL+":"+pr.Head.Ref] = localRef
-			head = localRef
 		}
+		head = localRef
 
 		// 5. Now if pr.Head.SHA == "" we should recover this to the head of this branch
 		if pr.Head.SHA == "" {
